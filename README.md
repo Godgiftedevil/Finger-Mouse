@@ -42,7 +42,7 @@ Built with **MediaPipe + OpenCV + PyAutoGUI**.
 ## 1️⃣ Clone repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/finger-mouse.git
+git clone https://github.com/Godgiftedevil/finger-mouse.git
 cd finger-mouse
 ```
 
