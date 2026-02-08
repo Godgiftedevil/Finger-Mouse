@@ -8,14 +8,15 @@ import time
 
 class FingerMouseController:
 
-    def __init__(self, cam_width=960, cam_height=720, smoothing_window=7):
+    def __init__(self, cam_width=960, cam_height=720):
 
         # -------- CONFIG --------
         self.margin = 100
-        self.click_frames_required = 4
-        self.click_cooldown = 0.5
-        self.scroll_gain = 8
-        self.drag_threshold_ratio = 0.45
+        self.click_frames_required = 2
+        self.click_cooldown = 0.35
+        self.scroll_gain = 12
+        self.drag_enter_frames = 10
+        self.pinch_ratio = 0.22
 
         # -------- SAFETY --------
         pyautogui.FAILSAFE = True
@@ -26,17 +27,21 @@ class FingerMouseController:
         self.mp_draw = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
             max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.6
+            min_detection_confidence=0.75,
+            min_tracking_confidence=0.7
         )
 
         # -------- SYSTEM --------
         self.sw, self.sh = pyautogui.size()
         self.cw, self.ch = cam_width, cam_height
 
-        # -------- SMOOTHING --------
-        self.x_hist = deque(maxlen=smoothing_window)
-        self.y_hist = deque(maxlen=smoothing_window)
+        # -------- SMOOTHING (Adaptive EMA) --------
+        self.ema_alpha = 0.35
+        self.sx = None
+        self.sy = None
+        self.prev_rx = None
+        self.prev_ry = None
+        self.y_hist = deque(maxlen=6)
 
         # -------- LANDMARK IDS --------
         self.INDEX = 8
@@ -46,16 +51,12 @@ class FingerMouseController:
         self.MCP = 9
 
         # -------- STATE --------
-        self.left_frames = 0
+        self.pinch_frames = 0
         self.right_frames = 0
-        self.drag_frames = 0
         self.dragging = False
-        self.scroll_mode = False
+        self.left_click_fired = False
+        self.right_click_fired = False
         self.last_click_time = 0
-
-        # -------- HAND DEBOUNCE --------
-        self.no_hand_frames = 0
-        self.no_hand_reset_frames = 3
 
         # -------- FPS --------
         self.frames = 0
@@ -65,16 +66,33 @@ class FingerMouseController:
     # ================= UTIL =================
 
     def smooth(self, x, y):
-        self.x_hist.append(x)
         self.y_hist.append(y)
-        return int(np.mean(self.x_hist)), int(np.mean(self.y_hist))
 
-    def reset_states(self):
-        self.left_frames = self.right_frames = self.drag_frames = 0
+        if self.sx is None:
+            self.sx, self.sy = x, y
+            self.prev_rx, self.prev_ry = x, y
+            return int(x), int(y)
 
-    def reset_smoothing(self):
-        self.x_hist.clear()
-        self.y_hist.clear()
+        dx = abs(x - self.prev_rx)
+        dy = abs(y - self.prev_ry)
+        speed = np.hypot(dx, dy)
+        self.prev_rx, self.prev_ry = x, y
+
+        alpha = np.clip(self.ema_alpha + speed / 1500.0, self.ema_alpha, 0.85)
+
+        self.sx += alpha * (x - self.sx)
+        self.sy += alpha * (y - self.sy)
+        return int(self.sx), int(self.sy)
+
+    def dist(self, lm, a, b):
+        p1, p2 = lm.landmark[a], lm.landmark[b]
+        return np.hypot(p1.x - p2.x, p1.y - p2.y)
+
+    def hand_scale(self, lm):
+        return self.dist(lm, self.WRIST, self.MCP)
+
+    def finger_up(self, lm, tip, pip):
+        return lm.landmark[tip].y < lm.landmark[pip].y
 
     def can_click(self):
         return (time.time() - self.last_click_time) > self.click_cooldown
@@ -82,18 +100,16 @@ class FingerMouseController:
     def mark_click(self):
         self.last_click_time = time.time()
 
-    def dist(self, lm, a, b):
-        p1, p2 = lm.landmark[a], lm.landmark[b]
-        return np.hypot(p1.x-p2.x, p1.y-p2.y)
-
-    def hand_scale(self, lm):
-        return self.dist(lm, self.WRIST, self.MCP)
+    def release_drag(self):
+        if self.dragging:
+            pyautogui.mouseUp()
+            self.dragging = False
 
     def update_fps(self):
         self.frames += 1
         now = time.time()
         if now - self.last_fps_time >= 1:
-            self.fps = self.frames/(now-self.last_fps_time)
+            self.fps = self.frames / (now - self.last_fps_time)
             self.frames = 0
             self.last_fps_time = now
 
@@ -101,7 +117,7 @@ class FingerMouseController:
 
     def process(self, img):
 
-        img = cv2.flip(img,1)
+        img = cv2.flip(img, 1)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         res = self.hands.process(rgb)
 
@@ -113,112 +129,143 @@ class FingerMouseController:
 
         if res.multi_hand_landmarks:
 
-            self.no_hand_frames = 0
             lm = res.multi_hand_landmarks[0]
             self.mp_draw.draw_landmarks(img,lm,self.mp_hands.HAND_CONNECTIONS)
 
             tip = lm.landmark[self.INDEX]
-            cx = int(tip.x*self.cw)
-            cy = int(tip.y*self.ch)
+            cx, cy = int(tip.x*self.cw), int(tip.y*self.ch)
 
             if not (self.margin < cx < self.cw-self.margin and
                     self.margin < cy < self.ch-self.margin):
-                if self.dragging:
-                    pyautogui.mouseUp()
-                    self.dragging = False
-                self.reset_states()
-                self.scroll_mode = False
+                self.release_drag()
                 return img
 
             sx = np.interp(cx,(self.margin,self.cw-self.margin),(0,self.sw))
             sy = np.interp(cy,(self.margin,self.ch-self.margin),(0,self.sh))
-            sx = int(np.clip(sx, 0, self.sw - 1))
-            sy = int(np.clip(sy, 0, self.sh - 1))
-            sx,sy = self.smooth(sx,sy)
+            sx, sy = self.smooth(sx, sy)
 
-            if not self.dragging:
+            # -------- gesture metrics --------
+            scale = self.hand_scale(lm)
+            th = scale * self.pinch_ratio
+
+            d_it = self.dist(lm,self.THUMB,self.INDEX)
+            d_mt = self.dist(lm,self.THUMB,self.MIDDLE)
+
+            index_up  = self.finger_up(lm,8,6)
+            middle_up = self.finger_up(lm,12,10)
+
+            index_pinch  = d_it < th
+            middle_pinch = d_mt < th
+
+            # =================================
+            # SCROLL — two fingers up
+            # =================================
+            if index_up and middle_up and not index_pinch and not middle_pinch:
+                gesture = "SCROLL"
+                self.release_drag()
+                self.pinch_frames = 0
+                self.right_frames = 0
+                self.left_click_fired = False
+                self.right_click_fired = False
+
+                if len(self.y_hist) >= 4:
+                    dy = np.diff(list(self.y_hist)[-4:])
+                    velocity = np.mean(dy)
+                    scroll = int(np.clip(velocity * self.scroll_gain, -60, 60))
+                    pyautogui.scroll(-scroll)
+
                 pyautogui.moveTo(sx,sy)
 
-            scale = self.hand_scale(lm)
-            th = scale * self.drag_threshold_ratio
-            d_ti = self.dist(lm,self.THUMB,self.INDEX)
-            d_tm = self.dist(lm,self.THUMB,self.MIDDLE)
+            # =================================
+            # RIGHT CLICK
+            # =================================
+            elif middle_pinch and not index_pinch and index_up and not self.dragging:
+                gesture = "RIGHT"
+                self.pinch_frames = 0
+                self.left_click_fired = False
 
-            # ---- SCROLL ----
-            if d_ti > th and d_tm > th*1.1:
-                if not self.scroll_mode:
-                    self.reset_states()
-                    self.scroll_mode = True
-                gesture = "SCROLL"
-                if len(self.y_hist)>1:
-                    delta = (self.y_hist[-1]-self.y_hist[-2])*self.scroll_gain
-                    delta = int(np.clip(delta,-40,40))
-                    pyautogui.scroll(-delta)
+                self.right_frames += 1
+                if (self.right_frames >= self.click_frames_required
+                        and not self.right_click_fired
+                        and self.can_click()):
+                    pyautogui.rightClick()
+                    self.mark_click()
+                    self.right_click_fired = True
+                    gesture = "RIGHT CLICK ✓"
 
-            # ---- DRAG ----
-            elif d_ti < th:
-                self.scroll_mode = False
-                self.drag_frames += 1
-                if self.drag_frames >= self.click_frames_required:
+                pyautogui.moveTo(sx,sy)
+
+            # =================================
+            # LEFT CLICK / DRAG
+            # =================================
+            elif index_pinch and not middle_pinch:
+
+                self.right_frames = 0
+                self.right_click_fired = False
+                self.pinch_frames += 1
+
+                if self.pinch_frames >= self.drag_enter_frames:
                     gesture = "DRAG"
                     if not self.dragging:
                         pyautogui.mouseDown()
                         self.dragging = True
-                pyautogui.moveTo(sx,sy)
+                    pyautogui.moveTo(sx,sy)
 
-            else:
-                if self.dragging:
-                    pyautogui.mouseUp()
-                    self.dragging = False
-                self.drag_frames = 0
-                self.scroll_mode = False
-
-            # ---- RIGHT CLICK ----
-            if not self.dragging and not self.scroll_mode:
-                if d_tm < th and d_ti > th:
-                    self.right_frames += 1
-                    if self.right_frames>=self.click_frames_required and self.can_click():
-                        pyautogui.rightClick()
-                        self.mark_click()
-                        gesture="RIGHT CLICK"
-                else:
-                    self.right_frames=0
-
-            # ---- LEFT CLICK ----
-            if not self.dragging and not self.scroll_mode:
-                if d_ti < th and self.drag_frames < self.click_frames_required:
-                    self.left_frames += 1
-                    if self.left_frames>=self.click_frames_required and self.can_click():
+                elif self.pinch_frames >= self.click_frames_required:
+                    if not self.left_click_fired and self.can_click():
                         pyautogui.click()
                         self.mark_click()
-                        gesture="LEFT CLICK"
+                        self.left_click_fired = True
+                        gesture = "LEFT CLICK ✓"
+                    pyautogui.moveTo(sx,sy)
+
                 else:
-                    self.left_frames=0
+                    gesture = "PINCH"
+                    pyautogui.moveTo(sx,sy)
+
+            # =================================
+            # MOVE
+            # =================================
+            else:
+                gesture = "MOVE"
+                self.release_drag()
+                self.pinch_frames = 0
+                self.right_frames = 0
+                self.left_click_fired = False
+                self.right_click_fired = False
+                pyautogui.moveTo(sx,sy)
+
+            # -------- debug --------
+            cv2.putText(img,f"I-T:{d_it:.3f} M-T:{d_mt:.3f} TH:{th:.3f}",
+                        (20,30),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),1)
 
         else:
-            self.no_hand_frames += 1
-            if self.no_hand_frames >= self.no_hand_reset_frames:
-                if self.dragging:
-                    pyautogui.mouseUp()
-                self.dragging = False
-                self.reset_states()
-                self.scroll_mode = False
-                self.reset_smoothing()
+            self.release_drag()
+            self.pinch_frames = 0
+            self.right_frames = 0
+            self.left_click_fired = False
+            self.right_click_fired = False
+            self.sx = self.sy = None
+            self.prev_rx = self.prev_ry = None
+            self.y_hist.clear()
 
         self.update_fps()
         cv2.putText(img,f"{gesture} | FPS:{int(self.fps)}",
-                    (20,self.ch-20),cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,(255,255,255),2)
+                    (20,self.ch-20),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
 
         return img
 
     def run(self):
 
         cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Camera not accessible")
+            return
+
         cap.set(3,self.cw)
         cap.set(4,self.ch)
 
-        print("FINAL PRODUCTION BUILD RUNNING")
+        print("Gesture Mouse Running — press Q to quit")
 
         try:
             while True:
@@ -226,8 +273,8 @@ class FingerMouseController:
                 if not ok:
                     break
 
-                out=self.process(frame)
-                cv2.imshow("Finger Mouse Final",out)
+                out = self.process(frame)
+                cv2.imshow("Gesture Mouse", out)
 
                 if cv2.waitKey(1)&0xFF==ord('q'):
                     break
@@ -236,8 +283,7 @@ class FingerMouseController:
             print("Failsafe triggered")
 
         finally:
-            if self.dragging:
-                pyautogui.mouseUp()
+            self.release_drag()
             cap.release()
             cv2.destroyAllWindows()
             self.hands.close()
